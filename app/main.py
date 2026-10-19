@@ -14,11 +14,11 @@ async def verify_token(token: Annotated[str, Depends(oauth2_scheme)], x_token: A
         raise HTTPException(status_code=401, detail="Invalid token")
     return token
 
-app = FastAPI(title="Okada BFF", description="Backend for Okada application", version="0.0.1")
+app = FastAPI(title="Ise BFF", description="Backend for Ise application", version="0.0.1")
 app.include_router(bookings.bookings_router, dependencies=[Depends(verify_token)])
 
 
 @app.get("/", tags=["root"], summary="Root endpoint")
 async def read_root():
-    return {"message": "Welcome to Okada BFF"}
+    return {"message": "Welcome to Ise BFF"}
 

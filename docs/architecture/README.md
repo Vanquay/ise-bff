@@ -68,7 +68,7 @@ skeleton; its `bookings` router is a placeholder that will be replaced.
 - **PostgreSQL (RDS) with `pgvector`.** The tracker is relational: applications join postings,
   companies, resumes, events and contacts. The invariants below are partial unique indexes and
   checks, and similarity search sits in the same database. DynamoDB would need all of this
-  rebuilt in application code.
+  rebuilt in application code; §2.9 shows what that design looks like.
 - **IDs:** UUIDv7, generated in the app (`uuid.uuid7()`, Python 3.14+). They sort by time, so
   they index well and paginate by id.
 - **Enumerations:** `text` with `CHECK` constraints instead of Postgres enums. Adding or removing a
@@ -626,6 +626,194 @@ The top 50 are inserted into `job_match` with `similarity`. The top 20 or so get
 - Confirmation screenshots are deleted after 180 days.
 - Prompts and completions are not stored by default. `llm_call` holds only metadata.
 
+### 2.9 Alternative: DynamoDB
+
+This is the same data model on DynamoDB. The recommendation is still Postgres (see the side-by-side
+comparison at the end of this section), but this design works. Choose before any repository code is
+written: switching later means rewriting every repository and migrating the data.
+
+#### Shape
+
+There are two tables. Both use on-demand capacity, with point-in-time recovery, deletion
+protection, and TTL on an `expires_at` attribute.
+
+- **`ise-user`** holds everything that belongs to one user, under `PK = USER#<user_id>`:
+  - One query reads, or deletes, a user's whole account.
+  - Tenant isolation comes from the key. Repositories build `PK` from the authenticated user,
+    never from request input.
+  - There are no LSIs, so there is no 10 GB cap on a user's item collection. One user's traffic is
+    far below the per-partition limits.
+- **`ise-catalog`** holds the shared companies, job sources and postings.
+
+Every item has the generic attributes `PK`, `SK`, `GSI1PK`, `GSI1SK`, `GSI2PK` and `GSI2SK`, plus
+a `type` attribute. IDs are still UUIDv7, so a sort key that ends in an id sorts by time.
+
+#### `ise-user` items
+
+| Item | PK | SK | Notes |
+|---|---|---|---|
+| User and profile | `USER#u` | `PROFILE` | `app_user` and `candidate_profile` merged |
+| Sign-in lookup | `SUB#<cognito_sub>` | `SUB` | Points to the user id |
+| Inbound email lookup | `INBOUND#<token>` | `INBOUND` | Points to the user id |
+| Search profile | `USER#u` | `SEARCH#<id>` | Query embedding stored as a binary attribute |
+| Saved answer | `USER#u` | `ANSWER#<id>` | Embedding stored as binary. The nearest saved answer is found in memory, since a user has tens of answers, not thousands. |
+| Watched company | `USER#u` | `WATCH#<company_id>` | |
+| Document | `USER#u` | `DOC#<id>` | |
+| Resume | `USER#u` | `RESUME#<id>` | Parsed JSON stored inline; plain text goes to S3 if large |
+| Master resume pointer | `USER#u` | `MASTER_RESUME` | Holds the master resume's id |
+| Job match | `USER#u` | `MATCH#<posting_id>` | |
+| Application | `USER#u` | `APP#<app_id>` | Copies of company name, domain, title and apply URL (no joins) |
+| Application-per-posting guard | `USER#u` | `APPFOR#<posting_id>` | Points to the application id |
+| Event | `USER#u` | `APP#<app_id>#EVT#<event_id>` | |
+| Interview | `USER#u` | `APP#<app_id>#INT#<id>` | |
+| Offer | `USER#u` | `APP#<app_id>#OFFER` | |
+| Contact link | `USER#u` | `APP#<app_id>#CONTACT#<contact_id>#<role>` | |
+| Bot run | `USER#u` | `APP#<app_id>#RUN#<run_id>` | `form_fields` and `answer_plan` inline, within the 400 KB item limit |
+| Active-run guard | `USER#u` | `APP#<app_id>#ACTIVE_RUN` | Points to the run id; also holds the apply-URL hash |
+| Submission guard | `USER#u` | `APP#<app_id>#SUBMITTED` | Points to the run id |
+| Contact | `USER#u` | `CONTACT#<id>` | |
+| Task | `USER#u` | `TASK#<id>` | |
+| Email | `USER#u` | `EMAIL#<id>` | Raw MIME still expires from S3 after 30 days |
+| Email dedupe guard | `USER#u` | `MSGID#<sha256(Message-ID)>` | |
+| LLM call | `USER#u` | `LLM#<id>` | `expires_at` set 90 days ahead |
+| LLM monthly spend | `USER#u` | `SPEND#<yyyy-mm>` | Updated with `ADD cost_usd :c`, so the budget check reads one item |
+
+- **Application page in one query:** `PK = USER#u AND begins_with(SK, "APP#<app_id>")` returns the
+  application with its events, interviews, offer, contacts and runs. The repository drops the
+  guard items from the result.
+- **Listing applications:** this always goes through GSI1, never `begins_with(SK, "APP#")`, which
+  would also return every child item.
+- **Shared work** (such as extracting a posting) logs its LLM calls under `PK = SYSTEM`.
+- **Account deletion:** query `PK = USER#u` and batch-delete everything it returns. Then delete the
+  `SUB#` and `INBOUND#` lookup items, whose keys are stored on the profile.
+
+#### `ise-user` indexes
+
+| Index | Keys | Items | Serves |
+|---|---|---|---|
+| GSI1 | `USER#u#APPS` / `<status>#<last_activity_at>` | applications | The board in one query, split into columns. One column is `begins_with(GSI1SK, "<status>#")`. |
+| | `USER#u#FEED#<state>` / `<score, zero-padded>#<posting_id>` | scored matches | The feed by score, descending. Unscored matches stay out of the feed until scored. |
+| | `USER#u#ACTIVE_RUNS` / `<apply_url_hash>` | active-run guards | The extension's `GET /runs/active?url=` |
+| GSI2 (sparse) | `DUE` / `<due_at>#<task_id>` | open, un-notified tasks | The reminder job, across all users |
+| | `AWAITING` / `<last_activity_at>#<app_id>` | applications in `applied` or `screening` | Daily ghosted suggestions |
+| | `RUNNING` / `<started_at>#<run_id>` | runs in `running` | The sweep for timed-out runs |
+
+GSI2 is sparse: when an item leaves the state, its GSI2 attributes are removed, which drops it from
+the index. The GSI2 partition keys are global and therefore hot. That's fine at this volume; if it
+grows, shard them with a suffix (`DUE#0` to `DUE#9`).
+
+#### `ise-catalog` items and indexes
+
+| Item | PK | SK | Notes |
+|---|---|---|---|
+| Company | `COMPANY#<id>` | `META` | Also in GSI1 under `CNAME#<normalized_name>`, for name lookup |
+| Company domain guard | `DOMAIN#<domain>` | `GUARD` | Points to the company id; deduplicates companies |
+| Job source | `SOURCE#<id>` | `META` | Active sources are in GSI2 as `POLL` / `<next_poll_at>#<source_id>` |
+| Posting | `JOB#<id>` | `META` | Extracted fields inline; description text and HTML in S3. Open postings are in GSI1 as `SOURCE#<id>#OPEN` / `<external_id>`. |
+| Posting dedupe guards | `JOBEXT#<source_id>#<external_id>` and `JOBURL#<sha256(canonical_url)>` | `GUARD` | Point to the posting id |
+
+The poller queries GSI2 with `POLL` and `GSI2SK <= now` to find the sources that are due. It then
+compares each board with that source's open postings in GSI1 and closes the postings that have
+disappeared.
+
+#### How each rule from §2.6 is enforced
+
+| Rule | DynamoDB mechanism |
+|---|---|
+| One application per posting | One `TransactWriteItems`: put the application, and put `APPFOR#<posting_id>` with `attribute_not_exists(PK)` |
+| One bot run in flight | Put the `ACTIVE_RUN` guard with `attribute_not_exists(PK)` when preparing. Delete it in the transaction that ends the run. |
+| Submitted at most once | Put the `SUBMITTED` guard with `attribute_not_exists(PK)` in the same transaction that marks the run `submitted`, moves the application to `applied` and writes the event |
+| No submission without approval | A condition on the run update: `attribute_exists(approved_at)` |
+| Valid status transitions | The condition `#status = :from` on every status update. This also prevents lost updates. |
+| No cross-tenant references | Every user item lives under the caller's `PK`. There are no foreign keys, so the repository must block deleting a resume or document that an application uses. |
+| One master resume | The single `MASTER_RESUME` pointer item |
+| Posting dedupe | The `JOBEXT#` and `JOBURL#` guards, put in the same transaction as the posting |
+| Each email processed once | The `MSGID#` guard |
+| EEO answers encrypted | Checked in the repository only; there is no database constraint |
+
+In Postgres each rule is declared once. In DynamoDB each rule is a convention that every write path
+must follow, and one code path that skips the transaction silently breaks it. To reduce that risk:
+
+- All writes for these rules go through one helper per rule in `adapters/dynamo.py`. The helpers
+  map `ConditionalCheckFailed` to a domain error: `AlreadyApplied`, `RunInProgress` or
+  `AlreadySubmitted`.
+- Integration tests run every rule against DynamoDB Local.
+
+A transaction can hold up to 100 items and costs twice as much as a plain write.
+
+#### Matching without pgvector
+
+DynamoDB has no vector search, so matching needs a second store:
+
+| Store | Fit |
+|---|---|
+| **Amazon S3 Vectors** | Serverless, pay per use, and supports metadata filters. **The best fit here.** Check its current top-K and filter limits and whether it's available in your region. |
+| OpenSearch Serverless | The richest filtering, plus hybrid keyword search. Its minimum capacity charge would be the largest line in the §3.9 budget. |
+| pgvector on RDS or Aurora | Works, but then you're running Postgres anyway. |
+
+With S3 Vectors, matching works like this:
+
+1. A posting's embedding is written to DynamoDB. A DynamoDB Stream sends the change through
+   EventBridge Pipes to the `bulk` queue, and a worker puts the vector into the `postings` index
+   with metadata: `remote_type`, `countries`, `salary_max`, `first_seen_day` and `open`.
+2. `match.user` queries the index with the search profile's embedding and metadata filters, and
+   takes the top K.
+3. The worker drops the postings the user already has (a `BatchGetItem` on `MATCH#<posting_id>`)
+   and those from excluded companies. It writes the rest as matches and sends the top 20 to the
+   LLM for scoring.
+4. When a posting closes, its vector is deleted.
+
+The Postgres version does steps 2 and 3 in one SQL statement (§2.7).
+
+#### Analytics
+
+DynamoDB has no ad-hoc queries, so analytics come from two places:
+
+- **Funnel numbers shown in the app** come from counters kept up to date by the stream: one
+  `STATS#<yyyy-mm>` item per user, updated with `ADD`. Each new metric needs a new counter and a
+  backfill.
+- **Ad-hoc analysis** (for example, response rate by resume variant) runs in Athena over DynamoDB's
+  incremental export to S3.
+
+#### What else changes
+
+- **Infrastructure:**
+  - Removed: RDS, Alembic and database connection management.
+  - Added: the two tables, the vector index, EventBridge Pipes (Streams to the `bulk` queue) and a
+    DynamoDB gateway VPC endpoint (free).
+- **Compute.** Without connection pools, `api` and `worker` fit Lambda naturally, so the Lambda
+  alternative in §3.2 becomes more attractive. The browser worker stays on ECS.
+- **Sweep job.** It gets smaller. Stream events replace the "posting has no embedding" checks, but
+  timed-out runs still need the GSI2 `RUNNING` query.
+- **Code layout:**
+  - `tables.py` becomes `items.py`, holding the key builders and Pydantic item models.
+  - Repositories call `adapters/dynamo.py`.
+  - Services don't change.
+- **Schema changes.** There are no migrations, and new attributes can be added freely. A new access
+  pattern needs a new GSI or a backfill script.
+- **Local development.** Use the `amazon/dynamodb-local` Docker image, with an in-memory vector
+  adapter (S3 Vectors has no local emulator).
+- **Cost.** DynamoDB on-demand plus S3 Vectors costs a few dollars a month at launch, against about
+  $15 for `db.t4g.micro`. The rest of the §3.9 cost floor doesn't change unless compute also moves
+  to Lambda.
+
+#### Side by side
+
+| | Postgres + pgvector | DynamoDB + S3 Vectors |
+|---|---|---|
+| Bot safety rules | Declared once in the schema | Guard items and conditions in every write path |
+| Matching | One SQL query | Vector store, then DynamoDB, then filtering in memory |
+| A new query or report | Write the SQL | A new GSI and a backfill, or an Athena export |
+| Shared postings | Joined at query time | Copied into each user's items |
+| Operations | Instance size, maintenance windows, connections | None |
+| Idle cost | ~$15/month | ~$0 |
+| Local development | A Postgres container | DynamoDB Local plus a vector fake |
+| Natural compute | ECS (or Lambda with RDS Proxy) | Lambda or ECS |
+
+**Recommendation:** stay on Postgres. Choose DynamoDB if you want a fully serverless stack (Lambda
+plus DynamoDB, with nothing running idle) and you're willing to design every access pattern up
+front.
+
 ---
 
 ## 3. System architecture (AWS + OpenAI)
@@ -1039,7 +1227,7 @@ These are the defaults this draft assumes. Change any of them before building.
 
 1. Multi-user from day one, with `user_id` on every row. This is cheap now and painful to add
    later. It also works for a single-user tool.
-2. PostgreSQL with pgvector as the only datastore.
+2. PostgreSQL with pgvector as the only datastore. A DynamoDB alternative is in §2.9.
 3. ECS on EC2 for all compute: one image and three services.
 4. Extension autofill is the default submit path. Server submit sits behind a flag and covers
    Greenhouse, Lever and Ashby only.
@@ -1051,6 +1239,8 @@ These are the defaults this draft assumes. Change any of them before building.
 
 - **Who is it for?** A personal tool or a product for other job seekers. This drives Cognito
   setup, the Chrome Web Store listing, billing, and how strict the per-user budgets need to be.
+- **Datastore.** Postgres (recommended) or DynamoDB (§2.9). Decide before writing any repository
+  code.
 - **Server-side submission in v1, or extension only?**
 - **Target markets.** This affects the work-authorisation fields, salary currencies, and the
   country filters on postings.
