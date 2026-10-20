@@ -6,7 +6,7 @@ from enum import Enum
 class UserRole(str, Enum):
     ADMIN = "admin"
     USER = "user"
-    
+
 class User(BaseModel):
     id: uuid.UUID
     email: str
